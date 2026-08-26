@@ -93,12 +93,18 @@ libSaiVS_a_SOURCES +=\
 					  vpp/SwitchVppMirror.cpp \
 					  vpp/SwitchVppSflow.cpp \
 					  vpp/SwitchVppMpls.cpp \
+					  vpp/SwitchVppTam.cpp \
+					  vpp/TamIpfixBuilder.cpp \
+					  vpp/VppHftExporter.cpp \
+					  vpp/VppHftNetlinkSender.cpp \
 					  vpp/TunnelManager.cpp \
 					  vpp/SaiVppLog.cpp \
 					  vpp/vppxlate/SaiVppXlate.c \
 					  vpp/vppxlate/SaiVppStats.c \
+					  vpp/vppxlate/SaiVppStatsReader.c \
 					  vpp/vppxlate/SaiAclStats.c \
 					  vpp/vppxlate/SaiIntfStats.c \
+					  vpp/vppxlate/SaiIntfStatsMap.c \
 					  vpp/vppxlate/SaiRouteStats.c
 endif
 

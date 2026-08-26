@@ -12,6 +12,7 @@
 
 #include "PortConfigFileParser.h"
 #include "SwitchVppUtils.h"
+#include "VppHftNetlinkSender.h"
 #include "saivs.h"
 
 #include <vector>
@@ -62,6 +63,8 @@ SwitchVpp::SwitchVpp(
     loadPortConfig();
 
     vpp_dp_initialize();
+
+    m_hftExporter = std::make_shared<VppHftExporter>();
 }
 
 SwitchVpp::SwitchVpp(
@@ -80,11 +83,21 @@ SwitchVpp::SwitchVpp(
     loadPortConfig();
 
     vpp_dp_initialize();
+
+    m_hftExporter = std::make_shared<VppHftExporter>();
 }
 
 SwitchVpp::~SwitchVpp()
 {
     SWSS_LOG_ENTER();
+
+    // Stop all telemetry streams and join the exporter worker before any
+    // switch state is destroyed, so no exporter callback can observe a
+    // partially destroyed object.
+    if (m_hftExporter)
+    {
+        m_hftExporter->shutdown();
+    }
 
     // Deregister VPP MAC events before stopping the thread so no callback
     // fires against a partially-destroyed object during join().
@@ -1194,10 +1207,34 @@ sai_status_t SwitchVpp::queryStatsStCapability(
 {
     SWSS_LOG_ENTER();
 
-    // VPP does not support streaming telemetry (HFTel / TAM).
-    // Returning NOT_SUPPORTED prevents HFTelOrch from being instantiated.
+    // VPP streams PORT counters only. QUEUE, BUFFER_POOL and
+    // INGRESS_PRIORITY_GROUP have no truthful VPP source, so their streaming
+    // capability stays unsupported.
+    if (object_type != SAI_OBJECT_TYPE_PORT)
+    {
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
 
-    return SAI_STATUS_NOT_SUPPORTED;
+    if (!m_hftExporter || !m_hftExporter->ownsStatsEndpoint())
+    {
+        SWSS_LOG_WARN("high frequency telemetry is disabled, the VPP statistics endpoint is "
+                "owned by another switch instance");
+
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+
+    // Fail closed while the telemetry Generic Netlink transport is missing, so
+    // orchagent never builds a pipeline whose records cannot be delivered.
+    if (!VppHftNetlinkSender::isFamilyAvailable())
+    {
+        SWSS_LOG_WARN("Generic Netlink family %s is not registered, high frequency telemetry "
+                "is not supported",
+                VppHftNetlinkSender::FAMILY_NAME);
+
+        return SAI_STATUS_NOT_SUPPORTED;
+    }
+
+    return VppHftExporter::queryPortStatsStCapability(stats_capability);
 }
 
 uint64_t SwitchVpp::getObjectTypeAvailability(
@@ -1634,6 +1671,29 @@ sai_status_t SwitchVpp::create(
         return create_internal(object_type, serializedObjectId, switch_id, attr_count, attr_list);
     }
 
+    // TAM object types. SwitchVpp overrides the generic create entry point, so
+    // the SwitchStateBase special cases must be dispatched explicitly here.
+    if (object_type == SAI_OBJECT_TYPE_TAM)
+    {
+        sai_object_id_t object_id;
+        sai_deserialize_object_id(serializedObjectId, object_id);
+        return createTam(object_id, switch_id, attr_count, attr_list);
+    }
+
+    if (object_type == SAI_OBJECT_TYPE_TAM_TELEMETRY)
+    {
+        sai_object_id_t object_id;
+        sai_deserialize_object_id(serializedObjectId, object_id);
+        return createTamTelemetry(object_id, switch_id, attr_count, attr_list);
+    }
+
+    if (object_type == SAI_OBJECT_TYPE_TAM_COUNTER_SUBSCRIPTION)
+    {
+        sai_object_id_t object_id;
+        sai_deserialize_object_id(serializedObjectId, object_id);
+        return createTamCounterSubscription(object_id, switch_id, attr_count, attr_list);
+    }
+
     return create_internal(object_type, serializedObjectId, switch_id, attr_count, attr_list);
 }
 
@@ -2036,6 +2096,20 @@ sai_status_t SwitchVpp::remove(
         return removeMirrorSession(object_id);
     }
 
+    if (object_type == SAI_OBJECT_TYPE_TAM_COUNTER_SUBSCRIPTION)
+    {
+        sai_object_id_t objectId;
+        sai_deserialize_object_id(serializedObjectId, objectId);
+        return removeTamCounterSubscription(objectId);
+    }
+
+    if (object_type == SAI_OBJECT_TYPE_TAM_TEL_TYPE)
+    {
+        sai_object_id_t objectId;
+        sai_deserialize_object_id(serializedObjectId, objectId);
+        return removeTamTelType(objectId);
+    }
+
     return remove_internal(object_type, serializedObjectId);
 }
 
@@ -2264,6 +2338,20 @@ sai_status_t SwitchVpp::set(
         return setLagMember(objectId, attr);
     }
 
+    if (objectType == SAI_OBJECT_TYPE_TAM_TEL_TYPE)
+    {
+        sai_object_id_t objectId;
+        sai_deserialize_object_id(serializedObjectId, objectId);
+        return setTamTelTypeVpp(objectId, attr);
+    }
+
+    if (objectType == SAI_OBJECT_TYPE_TAM_REPORT)
+    {
+        sai_object_id_t objectId;
+        sai_deserialize_object_id(serializedObjectId, objectId);
+        return setTamReportVpp(objectId, attr);
+    }
+
     return set_internal(objectType, serializedObjectId, attr);
 }
 
@@ -2358,6 +2446,40 @@ sai_status_t SwitchVpp::get(
                     serializedObjectId.c_str());
 
             return SAI_STATUS_FAILURE;
+        }
+
+        if (objectType == SAI_OBJECT_TYPE_TAM_TEL_TYPE &&
+            id == SAI_TAM_TEL_TYPE_ATTR_IPFIX_TEMPLATES)
+        {
+            sai_object_id_t telemetryTypeId;
+
+            sai_deserialize_object_id(serializedObjectId, telemetryTypeId);
+
+            auto config = m_hftExporter
+                    ? m_hftExporter->getStream(telemetryTypeId)
+                    : nullptr;
+
+            if (config == nullptr || config->templateMessage.empty())
+            {
+                return SAI_STATUS_ITEM_NOT_FOUND;
+            }
+
+            sai_status_t status = VppHftExporter::copyTemplateToSaiList(
+                    config->templateMessage,
+                    attr_list[idx].value.u8list);
+
+            if (status == SAI_STATUS_BUFFER_OVERFLOW)
+            {
+                final_status = status;
+                continue;
+            }
+
+            if (status != SAI_STATUS_SUCCESS)
+            {
+                return status;
+            }
+
+            continue;
         }
 
         sai_status_t status;
@@ -2935,6 +3057,14 @@ sai_status_t SwitchVpp::refresh_read_only(
         attr.id = meta->attrid;
         attr.value.u32 = m_crmTracker.getAvailable((sai_switch_attr_t)meta->attrid);
         return set(SAI_OBJECT_TYPE_SWITCH, m_switch_id, &attr);
+    }
+
+    // SwitchStateBase::refresh_tam_tel_ipfix_templates() is not virtual and
+    // returns placeholder bytes, so the committed VPP template is served here.
+    if (meta->objecttype == SAI_OBJECT_TYPE_TAM_TEL_TYPE &&
+        meta->attrid == SAI_TAM_TEL_TYPE_ATTR_IPFIX_TEMPLATES)
+    {
+        return refreshTamTelIpfixTemplates(object_id);
     }
 
     // For all other cases, delegate to the base class implementation

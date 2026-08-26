@@ -53,7 +53,8 @@ tests_SOURCES = main.cpp \
 				TestTAM.cpp
 
 if USE_VPP
-tests_SOURCES += TestSwitchVpp.cpp
+tests_SOURCES += TestSwitchVpp.cpp \
+				 TestVppHft.cpp
 endif
 
 tests_CXXFLAGS = $(DBGFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS_COMMON) -fno-access-control

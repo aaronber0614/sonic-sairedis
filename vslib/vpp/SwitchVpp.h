@@ -10,12 +10,16 @@
 #include "SwitchVppAcl.h"
 #include "CRMTracker.h"
 #include "PortConfigMap.h"
+#include "VppHftExporter.h"
+#include "VppHftTypes.h"
+#include "TamIpfixBuilder.h"
 
 #include "vppxlate/SaiVppXlate.h"
 #include "vppxlate/SaiRouteStats.h"
 
 #include <list>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <mutex>
 #include <atomic>
@@ -210,6 +214,62 @@ namespace saivs
                     _Out_ uint64_t *counters) override;
 
             virtual void processFdbEntriesForAging() override;
+
+        protected: // VPP high frequency telemetry (SAI TAM)
+
+            /**
+             * @brief Create a TAM counter subscription and mark its telemetry
+             * type dirty so the next CREATE_CONFIG rebuilds the stream.
+             */
+            sai_status_t createTamCounterSubscription(
+                    _In_ sai_object_id_t object_id,
+                    _In_ sai_object_id_t switch_id,
+                    _In_ uint32_t attr_count,
+                    _In_ const sai_attribute_t *attr_list);
+
+            sai_status_t removeTamCounterSubscription(
+                    _In_ sai_object_id_t object_id);
+
+            /** Quiesce the stream of a telemetry type before removing it. */
+            sai_status_t removeTamTelType(
+                    _In_ sai_object_id_t object_id);
+
+            /**
+             * @brief VPP TAM telemetry type state machine.
+             *
+             * Preserves the shared configuration change notification while
+             * adding validation, snapshot commit and worker control.
+             */
+            sai_status_t setTamTelTypeVpp(
+                    _In_ sai_object_id_t tam_tel_type_id,
+                    _In_ const sai_attribute_t *attr);
+
+            /** Apply a report interval update to every committed referencing stream. */
+            sai_status_t setTamReportVpp(
+                    _In_ sai_object_id_t tam_report_id,
+                    _In_ const sai_attribute_t *attr);
+
+            /**
+             * @brief Serve SAI_TAM_TEL_TYPE_ATTR_IPFIX_TEMPLATES from the
+             * committed snapshot.
+             */
+            sai_status_t refreshTamTelIpfixTemplates(
+                    _In_ sai_object_id_t tam_tel_type_id);
+
+            /**
+             * @brief Build and validate a candidate stream configuration from
+             * the current SAI TAM object graph.
+             */
+            sai_status_t buildHftStreamConfig(
+                    _In_ sai_object_id_t tam_tel_type_id,
+                    _Out_ std::shared_ptr<VppHftStreamConfig>& config);
+
+            sai_status_t getTamTelTypePollingInterval(
+                    _In_ sai_object_id_t tam_tel_type_id,
+                    _Out_ std::chrono::microseconds& interval);
+
+            void markHftConfigDirty(
+                    _In_ sai_object_id_t tam_tel_type_id);
 
         public:
 
@@ -1466,6 +1526,22 @@ namespace saivs
             sai_status_t bindMirrorPort(
                 _In_ sai_object_id_t portId,
                 _In_ const sai_attribute_t* attr);
+
+        private: // VPP high frequency telemetry
+
+            /**
+             * Owns the exporter worker, the committed stream snapshots and the
+             * fixed VPP statistics endpoint claim. Destroyed, and therefore
+             * joined, before the rest of the switch state.
+             */
+            std::shared_ptr<VppHftExporter> m_hftExporter;
+
+            /**
+             * Telemetry types whose counter subscriptions changed after their
+             * last CREATE_CONFIG. Only accessed from the serialized SAI API
+             * path.
+             */
+            std::set<sai_object_id_t> m_hftDirtyTelTypes;
 
     };
 }
